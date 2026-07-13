@@ -395,7 +395,9 @@ def get_init(protocols):
 
 
 def get_custom_protocol_class_name(database: Text, task: Text, protocol: Text):
-    return f"{database}__{task}__{protocol}"
+    # "@" appears in versioned protocol names (e.g. "Raw@only_words"); keep the
+    # generated class name a valid identifier for pickling friendliness.
+    return f"{database}__{task}__{protocol}".replace("@", "__at__")
 
 
 def create_protocol(
@@ -404,6 +406,7 @@ def create_protocol(
     protocol: Text,
     protocol_entries: Dict,
     database_yml: Path,
+    annotation_version: Text = None,
 ) -> Union[type, None]:
     """Create new protocol class
 
@@ -413,6 +416,10 @@ def create_protocol(
     task : str
     protocol : str
     protocol_entries : dict
+    annotation_version : str, optional
+        Annotation version this protocol was expanded from (versioned
+        protocols only). Exposed as the "annotation_version" key of every
+        yielded ProtocolFile.
 
     Returns
     -------
@@ -448,6 +455,9 @@ def create_protocol(
         protocol_entries = {"files": protocol_entries}
 
     metadata = dict()
+
+    if annotation_version is not None:
+        metadata["annotation_version"] = annotation_version
 
     if issubclass(base_class, SegmentationProtocol):
         if "classes" in protocol_entries:

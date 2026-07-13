@@ -2,6 +2,15 @@
 Changelog
 #########
 
+Develop
+~~~~~~~
+
+- feat: add annotation versioning — a protocol may declare ``versions:`` (a list of
+  names, or a mapping to per-subset overlays) with a ``{version}`` path placeholder;
+  select a version with ``registry.get_protocol("Db.Task.Protocol@version")`` (the
+  default is the explicit ``version:``, else ``original``, else the first listed),
+  and every file carries an ``annotation_version`` key
+
 Version 6.1.1 (2025-12-07)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 

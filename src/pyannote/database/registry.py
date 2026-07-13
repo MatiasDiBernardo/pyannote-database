@@ -47,6 +47,219 @@ class LoadingMode(Enum):
     ERROR = 2  # raise an error
 
 
+# --------------------------------------------------------------------------- #
+# Annotation versioning
+#
+# The set of annotation versions is declared once at the TASK level (shared by
+# every protocol of the task). In the common case each version differs only by
+# files organized in per-version folders, so `versions:` is just a list of
+# names and `{version}` is substituted into the paths:
+#
+#   SpeakerDiarization:
+#     versions: [original, only_words]           # shared; default is "original"
+#     Raw:
+#       scope: database
+#       train:
+#         uri: annotations/lists/{version}/train.lst
+#         annotation: annotations/rttm/{version}/{uri}.rttm
+#         annotated: annotations/uem/{uri}.uem    # shared: no {version}
+#     Benchmark:
+#       scope: database
+#       test: { ... }                             # same versions, no repetition
+#
+# A protocol is versioned only if it uses the {version} placeholder; a protocol
+# with no {version} stays unversioned even under a versioned task. `versions` /
+# `version` may also be set on an individual protocol to override the task-level
+# default.
+#
+# When a version needs to override specific entries (rather than live in a
+# {version} folder), use the mapping form, whose values are sparse
+# per-(subset, key) overlays ({} means "no override"):
+#
+#   versions:
+#     original: {}
+#     only_words:
+#       train: {uri: annotations/lists/train.sdm.lst}
+#
+# The default version (used when no "@version" is requested) is the explicit
+# `version:` key if given, else "original" if present, else the first listed.
+# `{version}` is substituted eagerly at configuration-load time; one protocol
+# is registered per version as "Raw@<version>", plus "Raw" for the default.
+# There is NO fallback: an unknown "@version" errors, and a version whose
+# substituted path does not exist fails like any wrong path.
+# --------------------------------------------------------------------------- #
+
+_VERSION_PLACEHOLDER = "{version}"
+
+# conventional default version name, used when a protocol declares `versions:`
+# but no explicit `version:` default
+_DEFAULT_VERSION = "original"
+
+
+def _substitute_version(value, version: Text):
+    """Replace the {version} placeholder in a string (pass anything else through)."""
+    if isinstance(value, str):
+        return value.replace(_VERSION_PLACEHOLDER, version)
+    return value
+
+
+def _uses_version_placeholder(protocol_entries: Dict) -> bool:
+    """Check whether any subset entry uses the {version} placeholder."""
+    for value in protocol_entries.values():
+        if not isinstance(value, dict):
+            continue
+        for key, entry in value.items():
+            if _VERSION_PLACEHOLDER in str(key) or (
+                isinstance(entry, str) and _VERSION_PLACEHOLDER in entry
+            ):
+                return True
+    return False
+
+
+def _apply_version(entries: Dict, overlay, version: Text, where: Text) -> Dict:
+    """Resolve one annotation version of a protocol block.
+
+    Substitutes {version} in every (subset, key) template, then applies the
+    version's sparse per-(subset, key) overlay on top.
+
+    Parameters
+    ----------
+    entries : dict
+        Protocol block without its `version` / `versions` keys.
+    overlay : dict or None
+        This version's entry in `versions:` (sparse {subset: {key: value}}).
+    version : str
+        Version name.
+    where : str
+        "Database.Task.Protocol (file.yml)" context, used in error messages.
+
+    Returns
+    -------
+    resolved : dict
+        Protocol block for this specific version.
+    """
+
+    if overlay is None:
+        overlay = dict()
+    if not isinstance(overlay, dict):
+        msg = (
+            f"Version '{version}' of {where} must be a mapping "
+            f"(subset -> entry overrides) or empty, got: {overlay!r}"
+        )
+        raise ValueError(msg)
+
+    resolved = dict()
+    for key, value in entries.items():
+        if isinstance(value, dict):
+            # subset entries: substitute {version} in both keys (used by
+            # X meta-protocol member names) and string values
+            resolved[key] = {
+                _substitute_version(k, version): _substitute_version(v, version)
+                for k, v in value.items()
+            }
+        else:
+            resolved[key] = value
+
+    for subset, subset_overlay in overlay.items():
+        if not isinstance(subset_overlay, dict):
+            msg = (
+                f"Version '{version}' of {where}: overlay for subset '{subset}' "
+                f"must be a mapping of entry keys to values, got: {subset_overlay!r}"
+            )
+            raise ValueError(msg)
+        base = dict(resolved.get(subset, dict()))
+        for key, value in subset_overlay.items():
+            base[key] = _substitute_version(value, version)
+        resolved[subset] = base
+
+    return resolved
+
+
+def _expand_versions(
+    db_name: Text,
+    task_name: Text,
+    protocol: Text,
+    protocol_entries,
+    database_yml,
+):
+    """Expand a protocol block into its per-version variants.
+
+    Returns a list of (protocol_name, entries, version) tuples:
+    - one ("<protocol>@<version>", entries, version) per declared version,
+    - plus ("<protocol>", entries, version) for the default version.
+
+    Protocol blocks without a `versions:` key are returned as
+    [(protocol, entries, None)], i.e. the exact unversioned behavior.
+    """
+
+    where = f"'{db_name}.{task_name}.{protocol}' ({database_yml})"
+
+    if not isinstance(protocol_entries, dict) or "versions" not in protocol_entries:
+        if isinstance(protocol_entries, dict) and _uses_version_placeholder(
+            protocol_entries
+        ):
+            msg = (
+                f"{where} uses the {{version}} placeholder "
+                f"but does not declare a 'versions:' block."
+            )
+            raise ValueError(msg)
+        return [(protocol, protocol_entries, None)]
+
+    entries = dict(protocol_entries)
+    versions = entries.pop("versions")
+
+    # `versions` is either a list of names (no overlays) or a mapping
+    # {name: overlay}. Normalize to an ordered {name: overlay} mapping.
+    if isinstance(versions, (list, tuple)):
+        versions_map = {str(v): {} for v in versions}
+        if len(versions_map) != len(versions):
+            msg = (
+                f"{where}: duplicate version name in 'versions:' list "
+                f"{list(versions)}."
+            )
+            raise ValueError(msg)
+    elif isinstance(versions, dict):
+        versions_map = {str(v): overlay for v, overlay in versions.items()}
+    else:
+        versions_map = None
+
+    if not versions_map:
+        msg = (
+            f"{where}: 'versions' must be a non-empty list of version names, "
+            f"or a mapping (version name -> optional per-subset overrides)."
+        )
+        raise ValueError(msg)
+
+    version_names = list(versions_map)
+
+    # default version: explicit `version:` key, else the conventional
+    # "original" version if present, else the first declared version.
+    if "version" in entries:
+        default = str(entries.pop("version"))
+        if default not in version_names:
+            msg = (
+                f"{where}: default version '{default}' is not declared in "
+                f"'versions:' (available: {sorted(version_names)})."
+            )
+            raise ValueError(msg)
+    elif _DEFAULT_VERSION in version_names:
+        default = _DEFAULT_VERSION
+    else:
+        default = version_names[0]
+
+    expanded = []
+    for version_name, overlay in versions_map.items():
+        resolved = _apply_version(entries, overlay, version_name, where)
+        expanded.append((f"{protocol}@{version_name}", resolved, version_name))
+        if version_name == default:
+            # fresh copy: create_protocol destructively pops entries
+            # (e.g. "scope"), so variants must not share dicts
+            resolved_again = _apply_version(entries, overlay, version_name, where)
+            expanded.append((protocol, resolved_again, version_name))
+
+    return expanded
+
+
 # To ease the understanding of future me, all comments inside Registry codebase
 # assume the existence of the following database.yml files.
 
@@ -306,7 +519,10 @@ class Registry:
         Parameters
         ----------
         name : str
-            Protocol full name (e.g. "Etape.SpeakerDiarization.TV")
+            Protocol full name (e.g. "Etape.SpeakerDiarization.TV").
+            An annotation version may be selected with an "@" suffix
+            (e.g. "AMI.SpeakerDiarization.Raw@only_words"); without it,
+            the protocol's default version is used.
         preprocessors : dict or (key, preprocessor) iterable
             When provided, each protocol item (dictionary) are preprocessed, such
             that item[key] = preprocessor(item). In case 'preprocessor' is not
@@ -319,11 +535,32 @@ class Registry:
             Protocol instance
         """
 
-        database_name, task_name, protocol_name = name.split(".")
+        # extract the optional "@version" suffix first so that version names
+        # may contain dots (e.g. "Raw@v2.1")
+        base_name, _, version = name.partition("@")
+        database_name, task_name, protocol_name = base_name.split(".")
+        if version:
+            protocol_name = f"{protocol_name}@{version}"
         database = self.get_database(database_name)
-        protocol = database.get_protocol(
-            task_name, protocol_name, preprocessors=preprocessors
-        )
+        try:
+            protocol = database.get_protocol(
+                task_name, protocol_name, preprocessors=preprocessors
+            )
+        except KeyError:
+            if not version:
+                raise
+            base_protocol = protocol_name.split("@", 1)[0]
+            available = [
+                p.split("@", 1)[1]
+                for p in database.get_protocols(task_name)
+                if p.startswith(f"{base_protocol}@")
+            ]
+            msg = (
+                f"Could not find version '{version}' of protocol "
+                f"'{database_name}.{task_name}.{base_protocol}' "
+                f"(available versions: {sorted(available) if available else 'none'})."
+            )
+            raise ValueError(msg)
         protocol.name = name
         return protocol
 
@@ -360,15 +597,54 @@ class Registry:
         protocols: Dict[Tuple[Text, Text], Type] = dict()
 
         for task_name, task_entries in db_entries.items():
+
+            # `versions` / `version` may be declared once at the task level
+            # (shared by every protocol of the task) instead of per protocol.
+            task_versions = task_version = None
+            if isinstance(task_entries, dict):
+                task_versions = task_entries.get("versions")
+                task_version = task_entries.get("version")
+
             for protocol, protocol_entries in task_entries.items():
-                protocol = str(protocol)
-                CustomProtocol = create_protocol(
-                    db_name, task_name, protocol, protocol_entries, database_yml
-                )
-                if CustomProtocol is None:
+
+                # reserved task-level keys, not protocols
+                if protocol in ("versions", "version"):
                     continue
 
-                protocols[(task_name, protocol)] = CustomProtocol
+                protocol = str(protocol)
+
+                # a protocol that uses the {version} placeholder but does not
+                # declare its own `versions` inherits the task-level ones;
+                # a protocol that uses no {version} stays unversioned even under
+                # a versioned task.
+                if (
+                    task_versions is not None
+                    and isinstance(protocol_entries, dict)
+                    and "versions" not in protocol_entries
+                    and _uses_version_placeholder(protocol_entries)
+                ):
+                    protocol_entries = dict(protocol_entries)
+                    protocol_entries["versions"] = task_versions
+                    if task_version is not None and "version" not in protocol_entries:
+                        protocol_entries["version"] = task_version
+
+                # expand `versions:` blocks into one protocol per version
+                # (a single [(protocol, entries, None)] when unversioned)
+                for variant_name, variant_entries, version in _expand_versions(
+                    db_name, task_name, protocol, protocol_entries, database_yml
+                ):
+                    CustomProtocol = create_protocol(
+                        db_name,
+                        task_name,
+                        variant_name,
+                        variant_entries,
+                        database_yml,
+                        annotation_version=version,
+                    )
+                    if CustomProtocol is None:
+                        continue
+
+                    protocols[(task_name, variant_name)] = CustomProtocol
 
         # If needed, merge old protocols dict with the new one (according to current override rules)
         if db_name in self.databases:
