@@ -1,0 +1,22 @@
+# Toy config demonstrating annotation versioning.
+#
+#   python examples/annotation_versions/demo.py
+#
+# One protocol, two annotation versions organized in per-version folders:
+#   - original : the base labeling (uris a, b)
+#   - refined  : a re-aligned labeling that also trains on fewer files (a only)
+#
+# `versions:` is just the list of names; `{version}` is substituted into every
+# path, so each version reads from its own folder. The default version (when no
+# "@version" is requested) is "original" by convention.
+
+Protocols:
+  TOY:
+    SpeakerDiarization:
+      versions: [original, refined]       # declared once; shared by every protocol
+      Diarization:
+        scope: file
+        train:
+          uri: annotations/lists/{version}/train.lst        # 2 uris vs 1 uri
+          annotation: annotations/rttm/{version}/{uri}.rttm # different labels
+          annotated: annotations/uem/{uri}.uem              # shared (no {version})
