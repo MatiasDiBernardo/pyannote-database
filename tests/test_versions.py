@@ -397,34 +397,53 @@ Protocols:
         registry.load_database(tmp_path / "database.yml")
 
 
-def test_missing_version_file_fails_loudly(tmp_path):
-    """No silent fallback: a version pointing at a missing file fails."""
-    _write(tmp_path / "lists" / "refined" / "train.lst", "u1\nu2\n")  # includes u2 ...
-    _write(
-        tmp_path / "rttm" / "refined" / "u1.rttm",  # ... but only u1 has an rttm
-        "SPEAKER u1 1 0.0 1.0 <NA> <NA> spk1 <NA> <NA>\n",
-    )
-    for uri in ("u1", "u2"):
+def test_partial_version_coverage_warns_and_skips(tmp_path):
+    """A version need not cover every recording: it yields the ones whose versioned
+    annotation file exists and warns about the expected-but-missing ones -- no per-version
+    list, no hard error, and never a fallback to another version's data."""
+    _write(tmp_path / "lists" / "train.lst", "u1\nu2\nu3\n")   # the protocol expects 3
+    # the 'refined' version covers only u1 and u3
+    for uri in ("u1", "u3"):
+        _write(
+            tmp_path / "rttm" / "refined" / f"{uri}.rttm",
+            f"SPEAKER {uri} 1 0.0 1.0 <NA> <NA> spk_{uri} <NA> <NA>\n",
+        )
+    # 'original' covers all three
+    for uri in ("u1", "u2", "u3"):
+        _write(
+            tmp_path / "rttm" / "original" / f"{uri}.rttm",
+            f"SPEAKER {uri} 1 0.0 1.0 <NA> <NA> spk_{uri} <NA> <NA>\n",
+        )
         _write(tmp_path / "uem" / f"{uri}.uem", f"{uri} 1 0.000 10.000\n")
     _write(
         tmp_path / "database.yml",
         """
 Protocols:
-  MissingFileDB:
+  PartialDB:
     SpeakerDiarization:
-      versions: [refined]
+      versions: [original, refined]
       Raw:
         scope: file
         train:
-          uri: lists/{version}/train.lst
+          uri: lists/train.lst
           annotation: rttm/{version}/{uri}.rttm
           annotated: uem/{uri}.uem
 """,
     )
     registry = Registry()
     registry.load_database(tmp_path / "database.yml")
-    protocol = registry.get_protocol("MissingFileDB.SpeakerDiarization.Raw@refined")
 
-    with pytest.raises(FileNotFoundError):
-        for file in protocol.train():
-            file["annotation"]  # u2 -> rttm/refined/u2.rttm does not exist
+    # subset version: yields the 2 available, warns about the 1 missing
+    refined = registry.get_protocol("PartialDB.SpeakerDiarization.Raw@refined")
+    with pytest.warns(UserWarning, match=r"refined.*2/3.*1 missing"):
+        files = list(refined.train())
+    assert sorted(f["uri"] for f in files) == ["u1", "u3"]        # u2 skipped, not errored
+    for f in files:                                               # yielded ones load fine
+        assert len(list(f["annotation"].itertracks())) == 1
+
+    # full-coverage version: no warning, all three
+    import warnings as _w
+    original = registry.get_protocol("PartialDB.SpeakerDiarization.Raw@original")
+    with _w.catch_warnings():
+        _w.simplefilter("error")                                  # any warning would fail
+        assert sorted(f["uri"] for f in original.train()) == ["u1", "u2", "u3"]

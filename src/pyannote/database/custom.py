@@ -154,6 +154,21 @@ def resolve_path(path: Path, database_yml: Path) -> Path:
     raise FileNotFoundError(msg)
 
 
+def _resolve_optional(path: Path, database_yml: Path):
+    """Like resolve_path but return None instead of raising when not found.
+
+    Used to test whether a versioned annotation file exists (for version
+    coverage) without loading it.
+    """
+    path = path.expanduser()
+    if path.is_file():
+        return path
+    relative_path = database_yml.parent / path
+    if relative_path.is_file():
+        return relative_path
+    return None
+
+
 def meta_subset_iter(
     meta_database: Text,
     meta_task: Text,
@@ -318,6 +333,41 @@ def subset_iter(
         raise ValueError(msg)
 
     uris = load_lst(resolve_path(Path(uri), database_yml))
+
+    # Annotation-version coverage: a version may cover only some of the protocol's
+    # recordings (e.g. a hand-curated relabeling of 10 files). Rather than require a
+    # per-version uri list, restrict the subset to the uris whose versioned annotation
+    # file actually exists, and warn about the expected-but-missing ones. This applies
+    # only to versioned protocols with a per-uri `annotation` template; it never falls
+    # back to another version -- it just uses this version's available files.
+    annotation_version = metadata.get("annotation_version")
+    annotation = entries.get("annotation")
+    if (
+        annotation_version is not None
+        and isinstance(annotation, str)
+        and "{uri}" in annotation
+    ):
+        present, missing = [], []
+        try:
+            for u in uris:
+                formatted = annotation.format(uri=u, database=database, subset=subset)
+                if _resolve_optional(Path(formatted), database_yml) is not None:
+                    present.append(u)
+                else:
+                    missing.append(u)
+        except (KeyError, IndexError):
+            # template has placeholders we can't fill here -> do not filter
+            present, missing = uris, []
+
+        if missing:
+            example = ", ".join(missing[:3]) + (" ..." if len(missing) > 3 else "")
+            warnings.warn(
+                f"annotation version '{annotation_version}' of "
+                f"{database}.{task}.{protocol}.{subset}: "
+                f"{len(present)}/{len(uris)} recording(s) have a '{annotation_version}' "
+                f"annotation; {len(missing)} missing ({example})."
+            )
+        uris = present
 
     lazy_loader = gather_loaders(entries=entries, database_yml=database_yml)
 

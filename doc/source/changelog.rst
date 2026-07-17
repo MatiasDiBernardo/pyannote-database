@@ -10,6 +10,10 @@ Develop
   select a version with ``registry.get_protocol("Db.Task.Protocol@version")`` (the
   default is the explicit ``version:``, else ``original``, else the first listed),
   and every file carries an ``annotation_version`` key
+- feat: annotation-version coverage — a versioned protocol with a per-uri ``annotation``
+  template yields only the recordings whose versioned annotation file exists and warns about
+  the expected-but-missing ones, so a version covering a subset of recordings needs no list of
+  its own (it never falls back to another version's data)
 
 Version 6.1.1 (2025-12-07)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
